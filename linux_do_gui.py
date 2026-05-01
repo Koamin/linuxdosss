@@ -587,33 +587,72 @@ class Bot:
         else:
             s.lg("未找到回复排序按钮，使用默认排序")
 
-        # 使用JS获取帖子 - 基于实际HTML结构
+        # 使用JS获取帖子 - 优先获取未读话题（带小蓝点）
         topics = s.pg.run_js("""
         function getTopics() {
             const rows = document.querySelectorAll('tr.topic-list-item');
-            const topics = [];
+            const unreadTopics = [];  // 未读话题（带小蓝点）
+            const readTopics = [];    // 已读话题（无小蓝点）
+
             rows.forEach(row => {
                 const link = row.querySelector('a.title.raw-link.raw-topic-link');
                 if (link) {
                     const href = link.getAttribute('href');
                     const title = link.textContent.trim();
                     const topicId = row.getAttribute('data-topic-id');
+
                     // 跳过置顶帖
                     if (href && title && !row.classList.contains('pinned')) {
-                        topics.push({
+                        // 检查是否有小蓝点（未读标记）
+                        const newTopicBadge = row.querySelector('.badge.badge-notification.new-topic');
+
+                        const topicData = {
                             url: href,
                             title: title.substring(0, 50),
-                            id: topicId
-                        });
+                            id: topicId,
+                            isUnread: !!newTopicBadge  // 是否未读
+                        };
+
+                        if (newTopicBadge) {
+                            unreadTopics.push(topicData);
+                        } else {
+                            readTopics.push(topicData);
+                        }
                     }
                 }
             });
-            return topics;
+
+            // 优先返回未读话题，如果没有未读的再返回已读的
+            return {
+                unread: unreadTopics,
+                read: readTopics,
+                all: [...unreadTopics, ...readTopics]
+            };
         }
         return getTopics();
         """)
 
-        return topics or []
+        if topics:
+            unread_count = len(topics.get("unread", []))
+            read_count = len(topics.get("read", []))
+            s.lg(f"找到 {unread_count} 个未读话题，{read_count} 个已读话题")
+
+            # 优先返回未读话题，如果未读话题少于3个，补充一些已读话题
+            unread = topics.get("unread", [])
+            read = topics.get("read", [])
+
+            if unread:
+                s.lg(f"优先浏览 {len(unread)} 个未读话题")
+                # 如果未读话题较少，可以补充一些已读话题
+                if len(unread) < 3 and read:
+                    s.lg(f"未读话题较少，补充 {min(3, len(read))} 个已读话题")
+                    return unread + read[:3]
+                return unread
+            else:
+                s.lg("没有未读话题，浏览已读话题")
+                return read
+
+        return []
 
     def get_floor_info(s):
         """获取楼层信息（当前楼层/总楼层）
@@ -957,8 +996,13 @@ class Bot:
         """浏览帖子 - 通过点击链接而不是直接访问URL"""
         title = topic["title"]
         topic_id = topic.get("id", "")
+        is_unread = topic.get("isUnread", False)
 
-        s.lg("浏览: " + title)
+        if is_unread:
+            s.lg("浏览未读话题: " + title)
+        else:
+            s.lg("浏览已读话题: " + title)
+
         try:
             # 关键修改：通过点击链接进入话题，而不是直接 get URL
             # 这样才能让"浏览话题"计数增加
@@ -991,23 +1035,9 @@ class Bot:
             # 等待页面加载
             s._random_delay(3, 5, "话题页面加载")
 
-            # 等待小蓝点消失（确保话题被标记为已读）
-            s.lg("等待话题标记为已读...")
-            blue_dot_disappeared = s.pg.run_js("""
-            function waitForRead() {
-                // 检查小蓝点是否消失
-                // 小蓝点通常在话题标题旁边，class 可能是 badge-notification 或类似的
-                const badge = document.querySelector('.badge-notification');
-                return !badge || badge.style.display === 'none';
-            }
-            return waitForRead();
-            """)
-
-            if blue_dot_disappeared:
-                s.lg("话题已标记为已读")
-            else:
-                s.lg("等待话题标记...")
-                time.sleep(2)  # 额外等待
+            # 注意：小蓝点在板块列表页面，不在话题详情页面
+            # 所以我们在这里只需要确保页面加载完成即可
+            s.lg("话题页面已加载")
 
             s.stats["topic"] += 1
 
@@ -1056,10 +1086,29 @@ class Bot:
                 s.do_reply()
 
             # 关键修改：返回板块列表
-            # 方法1：点击浏览器返回按钮
             s.lg("返回板块列表...")
             s.pg.back()
             s._random_delay(2, 3, "返回后等待")
+
+            # 如果是未读话题，检查小蓝点是否消失（确认已被标记为已读）
+            if is_unread:
+                badge_gone = s.pg.run_js(f"""
+                function checkBadgeGone() {{
+                    const topicRow = document.querySelector('tr.topic-list-item[data-topic-id="{topic_id}"]');
+                    if (!topicRow) {{
+                        return true;  // 找不到行，可能已刷新
+                    }}
+                    // 检查小蓝点是否还存在
+                    const badge = topicRow.querySelector('.badge.badge-notification.new-topic');
+                    return !badge;  // 返回 true 表示小蓝点已消失
+                }}
+                return checkBadgeGone();
+                """)
+
+                if badge_gone:
+                    s.lg("✓ 小蓝点已消失，话题已标记为已读")
+                else:
+                    s.lg("⚠ 小蓝点仍存在，可能需要更长浏览时间")
 
             return True
         except Exception as e:
