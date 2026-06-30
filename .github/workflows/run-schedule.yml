@@ -17,6 +17,11 @@
 #    Settings -> General -> Danger Zone -> Change visibility -> Make private
 #
 # 3. 添加 Secrets（Settings -> Secrets and variables -> Actions -> New repository secret）
+#
+#    【推荐】Cookie 登录（可绕过验证码）：
+#    - LINUXDO_COOKIES: 本地运行 `python extract_cookies.py` 后导出的 JSON 字符串
+#
+#    （可选回退）账号密码登录，cookie 失效时尝试：
 #    - LINUXDO_USERNAME: 你的 Linux.do 用户名
 #    - LINUXDO_PASSWORD: 你的 Linux.do 密码
 #
@@ -95,19 +100,25 @@ jobs:
       # 运行脚本
       - name: Run browse script
         env:
+          LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
         run: |
           # 获取参数（手动触发时使用输入值，定时触发时使用默认值）
           TOPICS="${{ github.event.inputs.topics || '30' }}"
           LIKE_RATE="${{ github.event.inputs.like_rate || '30' }}"
-          
+
           echo "========================================"
           echo "开始运行 Linux.do 自动浏览"
           echo "目标帖子数: $TOPICS"
           echo "点赞概率: $LIKE_RATE%"
+          if [ -n "$LINUXDO_COOKIES" ]; then
+            echo "登录方式: Cookie"
+          else
+            echo "登录方式: 账号密码"
+          fi
           echo "========================================"
-          
+
           python linux_do_headless.py \
             --topics "$TOPICS" \
             --like-rate "$LIKE_RATE" \

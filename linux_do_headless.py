@@ -10,7 +10,7 @@ Linux.do 论坛自动浏览脚本 (无头版 / Headless)
     - 无 GUI 环境
 
 功能：
-    - 自动登录（用户名 + 密码）
+    - 自动登录（支持 Cookie / 账号密码 两种方式，优先 Cookie）
     - 自动浏览多个板块
     - 随机点赞帖子
     - 防风控机制（随机间隔）
@@ -20,30 +20,25 @@ Linux.do 论坛自动浏览脚本 (无头版 / Headless)
 使用方法
 ================================================================================
 
-方式一：命令行参数
-    python linux_do_headless.py --username 你的用户名 --password 你的密码
+【推荐】方式一：Cookie 登录（可绕过登录验证码，适合 GitHub Actions）
+    1. 本地运行 `python extract_cookies.py`，手动登录后导出 cookie JSON
+    2. 把那串 JSON 设为环境变量或 Secret：
+       export LINUXDO_COOKIES='<JSON 字符串>'
+       python linux_do_headless.py
 
-方式二：环境变量（推荐用于 GitHub Actions）
+方式二：账号密码登录（可能遇到验证码）
     export LINUXDO_USERNAME="你的用户名"
     export LINUXDO_PASSWORD="你的密码"
     python linux_do_headless.py
 
 可选参数：
+    --cookies       Cookie JSON 字符串（覆盖 LINUXDO_COOKIES）
+    --cookies-file  从文件读取 cookies JSON
     --proxy         代理地址，如 127.0.0.1:7897
     --topics        浏览帖子数量，默认 30
     --like-rate     点赞概率，0-100，默认 30
-    --headless      是否无头模式，默认 true
-    --debug         调试模式，显示更多日志
-
-示例：
-    # 基本使用
-    python linux_do_headless.py -u myuser -p mypass
-
-    # 指定浏览数量和点赞率
-    python linux_do_headless.py -u myuser -p mypass --topics 50 --like-rate 20
-
-    # 使用代理
-    python linux_do_headless.py -u myuser -p mypass --proxy 127.0.0.1:7897
+    --no-headless   显示浏览器窗口（调试用）
+    --debug         调试模式
 
 ================================================================================
 GitHub Actions 配置
@@ -51,13 +46,17 @@ GitHub Actions 配置
 
 1. Fork 本仓库到你的账号，并设为私有
 
-2. 添加 Secrets（Settings -> Secrets and variables -> Actions）：
-   - LINUXDO_USERNAME: 你的 Linux.do 用户名
-   - LINUXDO_PASSWORD: 你的 Linux.do 密码
+2. 添加 Secret（Settings -> Secrets and variables -> Actions）：
+   - LINUXDO_COOKIES: 本地 `python extract_cookies.py` 导出的 JSON 字符串
+
+   （可选回退）也可以同时配置以下 Secret，cookie 失效时尝试账号密码登录：
+   - LINUXDO_USERNAME / LINUXDO_PASSWORD
 
 3. 启用 Actions（Actions -> I understand my workflows, go ahead and enable them）
 
 4. 定时任务会自动运行，也可以手动触发（Actions -> Run workflow）
+
+注意：Cookie 通常会在几周到几个月后过期，过期后重跑 extract_cookies.py 更新 Secret 即可。
 
 ================================================================================
 注意事项
@@ -73,6 +72,7 @@ GitHub Actions 配置
 
 import os
 import sys
+import json
 import random
 import time
 import argparse
@@ -161,18 +161,20 @@ class Logger:
 class LinuxDoBot:
     """Linux.do 自动浏览机器人（无头版）"""
 
-    def __init__(self, username, password, config=None, logger=None):
+    def __init__(self, username=None, password=None, cookies=None, config=None, logger=None):
         """
         初始化机器人
 
         Args:
-            username: Linux.do 用户名
-            password: Linux.do 密码
-            config: 配置字典，可选
-            logger: 日志工具，可选
+            username: Linux.do 用户名（cookie 登录时可省略）
+            password: Linux.do 密码（cookie 登录时可省略）
+            cookies:  cookie 列表 list[dict]，优先于账号密码使用
+            config:   配置字典，可选
+            logger:   日志工具，可选
         """
         self.username = username
         self.password = password
+        self.cookies = cookies
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.log = logger or Logger()
         self.page = None
@@ -242,10 +244,60 @@ class LinuxDoBot:
         """
         登录 Linux.do
 
+        优先级：cookies > 账号密码
+
         Returns:
             bool: 是否成功
         """
-        self.log.info("开始登录...")
+        if self.cookies:
+            if self._login_with_cookies():
+                return True
+            # cookie 失效时，如果还配了账号密码就回退
+            if self.username and self.password:
+                self.log.warning("Cookie 登录失败，回退到账号密码登录")
+            else:
+                return False
+
+        if not (self.username and self.password):
+            self.log.error("既无有效 cookie，也未提供账号密码，无法登录")
+            return False
+
+        return self._login_with_password()
+
+    def _login_with_cookies(self):
+        """使用 cookie 登录"""
+        self.log.info("使用 Cookie 登录...")
+        try:
+            # 先打开域名，再写 cookie，避免被浏览器丢弃
+            self.page.get(self.config["base_url"])
+            self._random_delay(1, 2, "首页加载")
+
+            # DrissionPage 接受 list[dict] 或 "name=value;name2=value2" 字符串
+            self.page.set.cookies(self.cookies)
+            self.log.debug(f"已写入 {len(self.cookies)} 条 cookie")
+
+            # 刷新让 cookie 生效
+            self.page.get(self.config["base_url"])
+            self._random_delay(2, 3, "验证登录态")
+
+            if self.page.ele("#current-user", timeout=5):
+                self.log.success("Cookie 登录成功")
+                return True
+
+            self.log.warning("Cookie 已失效或不完整")
+            return False
+        except Exception as e:
+            self.log.error(f"Cookie 登录出错: {e}")
+            return False
+
+    def _login_with_password(self):
+        """
+        使用账号密码登录 Linux.do
+
+        Returns:
+            bool: 是否成功
+        """
+        self.log.info("开始登录（账号密码）...")
 
         try:
             # 访问登录页面
@@ -556,6 +608,14 @@ def parse_args():
     parser.add_argument(
         "-p", "--password", help="Linux.do 密码（或设置环境变量 LINUXDO_PASSWORD）"
     )
+    parser.add_argument(
+        "--cookies",
+        help="Cookie JSON 字符串，list[dict] 格式，可用 extract_cookies.py 生成；"
+        "或环境变量 LINUXDO_COOKIES。优先于账号密码使用。",
+    )
+    parser.add_argument(
+        "--cookies-file", help="从文件读取 cookies JSON（与 --cookies 二选一）"
+    )
     parser.add_argument("--proxy", help="代理地址，如 127.0.0.1:7897")
     parser.add_argument("--topics", type=int, default=30, help="浏览帖子数量，默认 30")
     parser.add_argument(
@@ -569,30 +629,65 @@ def parse_args():
     return parser.parse_args()
 
 
+def _load_cookies(cookies_arg, cookies_file_arg, logger):
+    """从命令行 / 环境变量 / 文件加载 cookies，返回 list[dict] 或 None"""
+    raw = cookies_arg or os.environ.get("LINUXDO_COOKIES")
+    if not raw and cookies_file_arg:
+        try:
+            with open(cookies_file_arg, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except OSError as e:
+            logger.error(f"读取 cookies 文件失败: {e}")
+            return None
+
+    if not raw:
+        return None
+
+    try:
+        cookies = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Cookies JSON 解析失败: {e}")
+        return None
+
+    if not isinstance(cookies, list) or not cookies:
+        logger.error("Cookies 必须是非空的 list[dict]")
+        return None
+
+    return cookies
+
+
 def main():
     """主函数"""
     args = parse_args()
 
-    # 获取用户名和密码（优先命令行参数，其次环境变量）
+    # 创建日志工具
+    logger = Logger(debug=args.debug)
+
+    # 获取认证信息（优先 cookies，其次账号密码）
+    cookies = _load_cookies(args.cookies, args.cookies_file, logger)
     username = args.username or os.environ.get("LINUXDO_USERNAME")
     password = args.password or os.environ.get("LINUXDO_PASSWORD")
     proxy = args.proxy or os.environ.get("LINUXDO_PROXY")
 
     # 验证必要参数
-    if not username or not password:
-        print("错误: 请提供用户名和密码")
+    if not cookies and not (username and password):
+        print("错误: 请提供 cookies 或账号密码")
         print()
-        print("方式一: 命令行参数")
-        print("  python linux_do_headless.py -u 用户名 -p 密码")
+        print("方式一（推荐，可绕过验证码）: cookies")
+        print("  本地先运行: python extract_cookies.py")
+        print("  然后:  export LINUXDO_COOKIES='<上一步输出的 JSON>'")
+        print("        python linux_do_headless.py")
         print()
-        print("方式二: 环境变量")
+        print("方式二: 账号密码")
         print("  export LINUXDO_USERNAME='用户名'")
         print("  export LINUXDO_PASSWORD='密码'")
         print("  python linux_do_headless.py")
         sys.exit(1)
 
-    # 创建日志工具
-    logger = Logger(debug=args.debug)
+    if cookies:
+        logger.info(f"使用 Cookie 登录（{len(cookies)} 条）")
+    else:
+        logger.info("使用账号密码登录")
 
     # 配置
     config = {
@@ -600,7 +695,13 @@ def main():
     }
 
     # 创建机器人并运行
-    bot = LinuxDoBot(username=username, password=password, config=config, logger=logger)
+    bot = LinuxDoBot(
+        username=username,
+        password=password,
+        cookies=cookies,
+        config=config,
+        logger=logger,
+    )
 
     stats = bot.run(
         target_topics=args.topics, headless=not args.no_headless, proxy=proxy
