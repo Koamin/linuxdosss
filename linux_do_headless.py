@@ -73,6 +73,7 @@ GitHub Actions 配置
 import os
 import sys
 import json
+import platform
 import random
 import time
 import argparse
@@ -120,6 +121,48 @@ DEFAULT_CONFIG = {
     "wait_min": 1,  # 最小等待时间（秒）
     "wait_max": 3,  # 最大等待时间（秒）
 }
+
+
+def _find_chrome_path():
+    """探测 Chrome 二进制路径，返回第一个存在的，找不到返回 None。
+
+    优先用 CHROME_PATH 环境变量，否则按操作系统试常见路径。
+    DrissionPage 默认探测不到 .app 包内部的可执行文件，需要显式给出。
+    """
+    env = os.environ.get("CHROME_PATH")
+    if env and os.path.exists(env):
+        return env
+
+    system = platform.system()
+    if system == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/System/Volumes/Data/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser(
+                "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            ),
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        ]
+    elif system == "Linux":
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+    elif system == "Windows":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    else:
+        candidates = []
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
 
 
 # ============================================================================
@@ -208,6 +251,17 @@ class LinuxDoBot:
 
         try:
             options = ChromiumOptions()
+
+            # 显式指定 Chrome 路径（DrissionPage 默认探测不到 .app 包内部路径）
+            chrome_path = _find_chrome_path()
+            if chrome_path:
+                self.log.debug(f"使用 Chrome: {chrome_path}")
+                options.set_browser_path(chrome_path)
+            else:
+                self.log.warning(
+                    "未自动找到 Chrome，DrissionPage 会用默认探测。"
+                    "若启动失败请设置 CHROME_PATH 环境变量。"
+                )
 
             # 无头模式
             if headless:

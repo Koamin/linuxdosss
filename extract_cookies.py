@@ -42,6 +42,13 @@ except ImportError:
 BASE_URL = "https://linux.do"
 # 只导出这些域名下的 cookie，避免把无关 cookie 也带进 Secret
 COOKIE_DOMAINS = ("linux.do", ".linux.do", "connect.linux.do")
+# 这些 cookie 跟客户端 IP / User-Agent 强绑定，带到 GitHub Actions 上反而会
+# 让 Cloudflare 直接拒绝。剔除掉，让 Actions 用自己的 IP 重新过盾。
+STRIP_COOKIES = {
+    "cf_clearance",  # Cloudflare 过盾凭证（IP+UA 绑定）
+    "_cfuvid",       # Cloudflare 访客 ID
+    "__cfuvid",      # 同上（不同域）
+}
 
 
 def _find_chrome_path():
@@ -125,6 +132,12 @@ def extract_cookies(proxy=None, output=None, chrome_path=None):
         if not cookies:
             print("未抓到任何 linux.do 的 cookie，请确认登录成功后再试。")
             return 1
+
+        # 剔除 IP/UA 绑定的 Cloudflare cookie，避免在 GitHub Actions 上反而被 CF 直接拒
+        stripped = [c["name"] for c in cookies if c.get("name") in STRIP_COOKIES]
+        cookies = [c for c in cookies if c.get("name") not in STRIP_COOKIES]
+        if stripped:
+            print(f"已剔除 {len(stripped)} 条 IP/UA 绑定的 cookie: {', '.join(stripped)}")
 
         # 只保留 DrissionPage set.cookies 真正需要的字段，避免噪音
         keep_fields = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
