@@ -1,5 +1,5 @@
 # ================================================================================
-# Linux.do 自动浏览定时任务 定制版
+# Linux.do 自动浏览定时任务
 # ================================================================================
 #
 # 功能：
@@ -25,6 +25,11 @@
 #    - LINUXDO_USERNAME: 你的 Linux.do 用户名
 #    - LINUXDO_PASSWORD: 你的 Linux.do 密码
 #
+#    【可选】Clash 代理（解决 GitHub IP 被 linux.do/CF 拒绝的问题）：
+#    - CLASH_SUBSCRIPTION_URL: Clash/mihomo 订阅 yaml 链接
+#      例: https://update.glados-config.com/mihomo/.../glados.yaml
+#      未配置时跳过代理，直接连
+#
 # 4. 启用 Actions
 #    Actions -> I understand my workflows, go ahead and enable them
 #
@@ -47,7 +52,7 @@
 #
 # ================================================================================
 
-name: Run Schedule
+name: Run Schedule - my
 
 on:
   # 定时触发已禁用（避免错误通知）
@@ -65,7 +70,7 @@ on:
       like_rate:
         description: '点赞概率 (0-100)'
         required: false
-        default: '1'
+        default: '30'
 
 jobs:
   browse:
@@ -97,12 +102,92 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
 
+      # 启动 Clash (mihomo) 代理 —— 仅在配置了 CLASH_SUBSCRIPTION_URL 时生效
+      # 作用：绕开 GitHub Actions 出口 IP 被 linux.do/Cloudflare 拒绝的问题
+      - name: Setup Clash proxy
+        env:
+          CLASH_URL: ${{ secrets.CLASH_SUBSCRIPTION_URL }}
+        run: |
+          if [ -z "$CLASH_URL" ]; then
+            echo "未配置 CLASH_SUBSCRIPTION_URL，跳过代理"
+            exit 0
+          fi
+
+          echo "下载 mihomo..."
+          MIHOMO_VER="v1.18.10"
+          wget -q "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" -O mihomo.gz
+          gunzip mihomo.gz
+          chmod +x mihomo
+
+          echo "拉取 Clash 订阅..."
+          curl -sL --max-time 30 "$CLASH_URL" -o clash-config.yaml
+          if [ ! -s clash-config.yaml ]; then
+            echo "ERROR: 订阅下载失败或为空"
+            exit 1
+          fi
+
+          # 注入监听端口、强制 linux.do 走代理
+          pip install -q pyyaml
+          python <<'PY'
+          import yaml
+          with open('clash-config.yaml') as f:
+              cfg = yaml.safe_load(f)
+          cfg['mixed-port'] = 7890
+          cfg['allow-lan'] = False
+          cfg['log-level'] = 'warning'
+          cfg['external-controller'] = '127.0.0.1:9090'
+
+          # 选定路由目标：优先第一个 proxy-group（通常是节点选择），否则用第一个 proxy
+          target = None
+          if cfg.get('proxy-groups'):
+              target = cfg['proxy-groups'][0]['name']
+          elif cfg.get('proxies'):
+              target = cfg['proxies'][0]['name']
+
+          if not target:
+              raise SystemExit('订阅里没有可用的 proxy / proxy-group')
+
+          rules = cfg.get('rules') or []
+          # 插在最前，覆盖订阅自带的规则
+          rules.insert(0, f'DOMAIN-SUFFIX,linux.do,{target}')
+          rules.insert(1, f'DOMAIN-SUFFIX,connect.linux.do,{target}')
+          cfg['rules'] = rules
+
+          with open('clash-config.yaml', 'w') as f:
+              yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+          print(f'linux.do 将走代理: {target}')
+          PY
+
+          echo "启动 mihomo..."
+          mkdir -p mihomo-data
+          ./mihomo -f clash-config.yaml -d mihomo-data > mihomo.log 2>&1 &
+          echo $! > mihomo.pid
+
+          # 等代理就绪
+          echo "等待代理就绪..."
+          for i in $(seq 1 20); do
+            if curl -s -x http://127.0.0.1:7890 --max-time 10 -o /dev/null -w '' https://linux.do; then
+              echo "代理就绪 (127.0.0.1:7890)"
+              echo "LINUXDO_PROXY=127.0.0.1:7890" >> $GITHUB_ENV
+              # 验证出口 IP
+              echo "出口 IP: $(curl -s -x http://127.0.0.1:7890 --max-time 10 https://api.ipify.org || echo unknown)"
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "ERROR: 代理启动超时"
+          echo "--- mihomo.log ---"
+          tail -50 mihomo.log
+          exit 1
+
       # 运行脚本
       - name: Run browse script
         env:
           LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
+          # LINUXDO_PROXY 由上一步注入到 GITHUB_ENV，未启用代理时为空
         run: |
           # 获取参数（手动触发时使用输入值，定时触发时使用默认值）
           TOPICS="${{ github.event.inputs.topics || '30' }}"
@@ -116,6 +201,11 @@ jobs:
             echo "登录方式: Cookie"
           else
             echo "登录方式: 账号密码"
+          fi
+          if [ -n "${LINUXDO_PROXY:-}" ]; then
+            echo "代理: $LINUXDO_PROXY"
+          else
+            echo "代理: 直连"
           fi
           echo "========================================"
 
@@ -133,3 +223,17 @@ jobs:
           echo "- 触发方式: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- 运行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
           echo "- 北京时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${LINUXDO_PROXY:-}" ]; then
+            echo "- 代理: 启用 ($LINUXDO_PROXY)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- 代理: 未启用" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # 关闭 mihomo（即使 job 结束 VM 也会回收，这一步主要为日志干净）
+      - name: Stop Clash proxy
+        if: always()
+        run: |
+          if [ -f mihomo.pid ]; then
+            kill "$(cat mihomo.pid)" 2>/dev/null || true
+            echo "mihomo 已停止"
+          fi
